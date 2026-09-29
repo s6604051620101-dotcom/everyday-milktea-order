@@ -1,489 +1,607 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { use, useState, useEffect } from 'react'
 import { supabase } from '@/lib/supabaseClient'
 
-export default function GenerateQRPage() {
-  // 1. State ของฟอร์ม
-  const postnatalState = { tableNumber: '', adultCount: '1', childCount: '0' }
-  const [formData, setFormData] = useState(postnatalState)
-  
-  // State ของระบบ Session และการแสดงผล QR
-  const [activeSession, setActiveSession] = useState(null) // เก็บข้อมูลถ้าเจอโต๊ะเปิดค้างอยู่
-  const [createdSessionData, setCreatedSessionData] = useState(null) // เก็บข้อมูลเมื่อสร้างสำเร็จเพื่อโชว์ QR
-  const [loading, setLoading] = useState(false)
-  const [errorMessage, setErrorMessage] = useState('')
+export default function TableOrderPage({ params }) {
+  // Unwrap params ด้วย use() ตามข้อกำหนด Next.js ล่าสุด
+  const resolvedParams = use(params)
+  const tableNumber = parseInt(resolvedParams.tableNumber)
 
-  // State ของกล่องยืนยันปิดโต๊ะเดิม (Confirm Dialog)
-  const [showConfirmModal, setShowConfirmModal] = useState(false)
-  const [elapsedMinutes, setElapsedMinutes] = useState(0)
+  // State ควบคุมสถานะ Session และข้อมูลร้าน
+  const [session, setSession] = useState(null)
+  const [loadingSession, setLoadingSession] = useState(true)
+  const [sessionError, setSessionError] = useState(false)
+  const [isSessionClosed, setIsSessionClosed] = useState(false)
 
-  // คำนวณเวลา "เปิดมาแล้ว N นาที" เมื่อเปิด Modal ยืนยัน
+  // State เมนูอาหาร
+  const [categories, setCategories] = useState([])
+  const [menuItems, setMenuItems] = useState([])
+  const [activeCategory, setActiveCategory] = useState(null)
+
+  // State ตะกร้าสินค้าและการส่งออเดอร์
+  const [cart, setCart] = useState({}) // เช่น { "ชาไทย": 2, "ไข่มุก": 1 }
+  const [submitting, setSubmitting] = useState(false)
+  const [orderSuccessMsg, setOrderSuccessMsg] = useState(false)
+
+  // State สำหรับปุ่มเรียกเก็บเงิน (Checkout Modal)
+  const [showCheckoutModal, setShowCheckoutModal] = useState(false)
+  const [checkingOut, setCheckingOut] = useState(false)
+
+  // 1. ตรวจสอบ Session ของโต๊ะเมื่อโหลดหน้าเว็บ
   useEffect(() => {
-    if (activeSession && activeSession.created_at) {
-      const createdAtTime = new Date(activeSession.created_at).getTime()
-      const now = new Date().getTime()
-      const diffMs = now - createdAtTime
-      const diffMins = Math.floor(diffMs / (1000 * 60))
-      setElapsedMinutes(diffMins >= 0 ? diffMins : 0)
-    }
-  }, [activeSession])
-
-  // ฟังก์ชันกดปุ่ม "เปิดโต๊ะ"
-  const handleOpenTable = async (e) => {
-    e.preventDefault()
-    setErrorMessage('')
-    setLoading(true)
-    setActiveSession(null)
-    setCreatedSessionData(null)
-
-    const tableNum = parseInt(formData.tableNumber)
-    const adult = parseInt(formData.adultCount)
-    const child = parseInt(formData.childCount)
-
-    if (!tableNum || isNaN(tableNum)) {
-      setErrorMessage('กรุณากรอกเลขโต๊ะให้ถูกต้อง')
-      setLoading(false)
-      return
-    }
-
-    try {
-      // 2. เช็คว่ามีตาราง sessions ของโต๊ะนี้ที่ status = 'open' อยู่แล้วหรือไม่
-      const { data: existingSessions, error: fetchError } = await supabase
-        .from('sessions')
-        .select('*')
-        .eq('table_number', tableNum)
-        .eq('status', 'open')
-        .limit(1)
-
-      if (fetchError) throw fetchError
-
-      if (existingSessions && existingSessions.length > 0) {
-        // ถ้ามีอยู่แล้ว ให้เก็บข้อมูลเพื่อแสดงกล่องเตือน (ไม่สร้างใหม่)
-        setActiveSession(existingSessions[0])
-        setLoading(false)
+    async function fetchSessionAndMenu() {
+      if (isNaN(tableNumber)) {
+        setSessionError(true)
+        setLoadingSession(false)
         return
       }
 
-      // ถ้าไม่มี ให้ insert แถวใหม่ลงตาราง sessions
-      const { data: newSession, error: insertError } = await supabase
-        .from('sessions')
-        .insert([
-          {
-            table_number: tableNum,
-            adult_count: adult,
-            child_count: child,
-            status: 'open'
-          }
-        ])
-        .select()
-        .single()
+      try {
+        // เช็คโต๊ะที่เปิดอยู่ (status = 'open')
+        const { data: sessionData, error: sessionErr } = await supabase
+          .from('sessions')
+          .select('*')
+          .eq('table_number', tableNumber)
+          .eq('status', 'open')
+          .limit(1)
 
-      if (insertError) throw insertError
+        if (sessionErr || !sessionData || sessionData.length === 0) {
+          setSessionError(true)
+          setLoadingSession(false)
+          return
+        }
 
-      // สร้างสำเร็จ เตรียมแสดงผล QR
-      setCreatedSessionData(newSession)
-    } catch (err) {
-      console.error('Error opening table:', err)
-      setErrorMessage('เกิดข้อผิดพลาดในการเชื่อมต่อฐานข้อมูล กรุณาลองใหม่อีกครั้ง')
-    } finally {
-      setLoading(false)
+        setSession(sessionData[0])
+
+        // ดึงหมวดหมู่เมนู
+        const { data: catData, error: catErr } = await supabase
+          .from('menu_categories')
+          .select('*')
+          .order('sort_order', { ascending: true })
+
+        if (catErr) throw catErr
+        setCategories(catData || [])
+        if (catData && catData.length > 0) {
+          setActiveCategory(catData[0].id)
+        }
+
+        // ดึงรายการเมนูทั้งหมด
+        const { data: itemData, error: itemErr } = await supabase
+          .from('menu_items')
+          .select('*')
+
+        if (itemErr) throw itemErr
+        setMenuItems(itemData || [])
+
+      } catch (err) {
+        console.error('Error loading data:', err)
+        setSessionError(true)
+      } finally {
+        setLoadingSession(false)
+      }
     }
+
+    fetchSessionAndMenu()
+  }, [tableNumber])
+
+  // จัดการเพิ่ม/ลด จำนวนในตะกร้า
+  const handleQuantityChange = (itemName, delta) => {
+    setCart((prev) => {
+      const currentQty = prev[itemName] || 0
+      const newQty = currentQty + delta
+
+      // คำนวณจำนวนรวมทั้งหมดในตะกร้า
+      const totalItemsCount = Object.values({ ...prev, [itemName]: newQty }).reduce((a, b) => a + b, 0)
+      
+      // จำกัดรวมไม่เกิน 10 รายการต่อการส่ง 1 ครั้ง
+      if (delta > 0 && totalItemsCount > 10) {
+        alert('จำกัดการสั่งซื้อสูงสุด 10 รายการต่อครั้ง กรุณาส่งออเดอร์ก่อนครับ')
+        return prev
+      }
+
+      const updated = { ...prev }
+      if (newQty <= 0) {
+        delete updated[itemName]
+      } else {
+        if (newQty > 5) return prev // จำกัด 1 เมนูเลือกได้สูงสุด 5 ชิ้น
+        updated[itemName] = newQty
+      }
+      return updated
+    })
   }
 
-  // ฟังก์ชันกดยืนยัน "ปิดโต๊ะเดิม"
-  const handleCloseExistingSession = async () => {
-    if (!activeSession) return
-    setLoading(true)
+  // คำนวณจำนวนรายการรวมในตะกร้า
+  const totalCartCount = Object.values(cart).reduce((a, b) => a + b, 0)
+
+  // 2. ส่งออเดอร์ไปยังตาราง orders
+  const handleSubmitOrder = async () => {
+    if (totalCartCount === 0 || !session) return
+    setSubmitting(true)
+
+    // แปลงตะกร้าเป็นรูปแบบ Array ตามโครงสร้าง jsonb items: [{name, quantity}]
+    const itemsArray = Object.entries(cart).map(([name, quantity]) => ({
+      name,
+      quantity
+    }))
 
     try {
-      // Update ตาราง sessions ให้ status = 'closed' เฉพาะแถวนี้ และเช็คซ้ำว่า status ยังเป็น 'open' อยู่
-      const { data, error } = await supabase
-        .from('sessions')
-        .update({ status: 'closed' })
-        .eq('id', activeSession.id)
-        .eq('status', 'open')
-        .select()
+      const { error } = await supabase
+        .from('orders')
+        .insert([
+          {
+            session_id: session.id,
+            table_number: tableNumber,
+            items: itemsArray,
+            status: 'received'
+          }
+        ])
 
       if (error) throw error
 
-      if (!data || data.length === 0) {
-        alert('โต๊ะนี้อาจถูกปิดไปแล้วโดยอุปกรณ์อื่น')
-      }
-
-      // ปิดสำเร็จ ปิด Modal, เอากล่องเตือนออก, กลับไปที่ฟอร์มเดิม (ค่าที่กรอกไว้ยังอยู่)
-      setShowConfirmModal(false)
-      setActiveSession(null)
+      // สำเร็จ เคลียร์ตะกร้า แสดงข้อความแจ้งเตือน
+      setCart({})
+      setOrderSuccessMsg(true)
+      setTimeout(() => setOrderSuccessMsg(false), 4000)
     } catch (err) {
-      console.error('Error closing session:', err)
-      alert('ไม่สามารถปิดออเดอร์เดิมได้ กรุณาลองใหม่')
+      console.error('Error submitting order:', err)
+      alert('เกิดข้อผิดพลาดในการส่งออเดอร์ กรุณาลองใหม่อีกครั้ง')
     } finally {
-      setLoading(false)
+      setSubmitting(false)
     }
   }
 
-  // ฟังก์ชันคัดลอกลิงก์
-  const handleCopyLink = (url) => {
-    navigator.clipboard.writeText(url)
-    alert('คัดลอกลิงก์เรียบร้อยแล้ว!')
+  // 3. ฟังก์ชันเรียกเก็บเงิน & ปิด Session
+  const handleCheckoutConfirm = async () => {
+    if (!session) return
+    setCheckingOut(true)
+
+    try {
+      const { error } = await supabase
+        .from('sessions')
+        .update({ status: 'closed' })
+        .eq('id', session.id)
+
+      if (error) throw error
+
+      setIsSessionClosed(true)
+      setShowCheckoutModal(false)
+    } catch (err) {
+      console.error('Error closing session:', err)
+      alert('ไม่สามารถทำรายการได้ กรุณาติดต่อพนักงาน')
+    } finally {
+      setCheckingOut(false)
+    }
   }
 
-  // ฟังก์ชันกด "เปิดโต๊ะใหม่" เพื่อรีเซ็ตหน้าจอทั้งหมด
-  const handleReset = () => {
-    setCreatedSessionData(null)
-    setActiveSession(null)
-    setFormData({ tableNumber: '', adultCount: '1', childCount: '0' })
+  // คำนวณยอดเงิน (ผู้ใหญ่ × 289 + เด็ก × 145)
+  const totalBill = session ? (session.adult_count * 289) + (session.child_count * 145) : 0
+
+  // หน้าจอ: กำลังโหลด
+  if (loadingSession) {
+    return (
+      <div style={styles.centerScreen}>
+        <h2>🧋 กำลังโหลดข้อมูลร้าน...</h2>
+      </div>
+    )
   }
 
-  // Domain ปัจจุบันสำหรับสร้าง URL (ใช้งานได้ทั้ง Local และ Production บน Vercel)
-  const origin = typeof window !== 'undefined' ? window.location.origin : ''
-  const targetUrl = createdSessionData ? `${origin}/order/${createdSessionData.table_number}` : ''
-  const encodedUrl = encodeURIComponent(targetUrl)
-  const qrCodeImageUrl = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodedUrl}`
+  // หน้าจอ: โต๊ะยังไม่เปิดใช้งาน (ข้อ 1)
+  if (sessionError) {
+    return (
+      <div style={styles.centerScreen}>
+        <div style={styles.alertBoxRed}>
+          <h2 style={{ fontSize: '1.8rem', marginBottom: '10px' }}>⚠️ แจ้งเตือน</h2>
+          <p style={{ fontSize: '1.2rem' }}>โต๊ะนี้ยังไม่เปิดใช้งาน กรุณาแจ้งพนักงาน</p>
+        </div>
+      </div>
+    )
+  }
+
+  // หน้าจอ: ขอบคุณที่ใช้บริการ หลังปิดบิลแล้ว (ข้อ 3)
+  if (isSessionClosed) {
+    return (
+      <div style={styles.centerScreen}>
+        <div style={styles.alertBoxGreen}>
+          <h1 style={{ fontSize: '2.5rem', marginBottom: '15px' }}>🎉 ขอบคุณที่ใช้บริการ</h1>
+          <p style={{ fontSize: '1.3rem' }}>Everyday Milktea หวังว่าจะได้ต้อนรับท่านอีกครับ/ค่ะ</p>
+        </div>
+      </div>
+    )
+  }
+
+  // กรองเมนูตามหมวดหมู่ที่เลือก
+  const currentCategoryItems = menuItems.filter(item => item.category_id === activeCategory)
 
   return (
-    <main style={styles.container}>
-      <h1 style={styles.headerTitle}>🧋 เปิดโต๊ะ & สร้าง QR Code</h1>
-      <p style={styles.subTitle}>ระบบพนักงานหน้าร้าน Everyday Milktea</p>
+    <div style={styles.container}>
+      {/* --- ส่วนหัว: ชื่อร้าน + ปุ่มเรียกเก็บเงิน (ข้อ 3) --- */}
+      <header style={styles.header}>
+        <div>
+          <h1 style={styles.shopTitle}>🧋 Everyday Milktea</h1>
+          <p style={styles.tableBadge}>โต๊ะที่ {tableNumber}</p>
+        </div>
+        <button 
+          onClick={() => setShowCheckoutModal(true)} 
+          style={styles.checkoutButton}
+        >
+          💳 เรียกเก็บเงิน
+        </button>
+      </header>
 
-      {/* แสดง Error ถ้ามี */}
-      {errorMessage && <div style={styles.errorBox}>{errorMessage}</div>}
-
-      {/* --- กรณีที่ 1: ยังไม่ได้สร้าง QR หรือเพิ่งเคลียร์ค่า ให้แสดงฟอร์มปกติ --- */}
-      {!createdSessionData && (
-        <form onSubmit={handleOpenTable} style={styles.formCard}>
-          <div style={styles.inputGroup}>
-            <label style={styles.label}>เลขโต๊ะ (Table Number):</label>
-            <input
-              type="number"
-              required
-              min="1"
-              value={formData.tableNumber}
-              onChange={(e) => setFormData({ ...formData, tableNumber: e.target.value })}
-              style={styles.input}
-              placeholder="เช่น 7"
-            />
-          </div>
-
-          <div style={styles.inputGroup}>
-            <label style={styles.label}>จำนวนผู้ใหญ่:</label>
-            <input
-              type="number"
-              required
-              min="1"
-              value={formData.adultCount}
-              onChange={(e) => setFormData({ ...formData, adultCount: e.target.value })}
-              style={styles.input}
-            />
-          </div>
-
-          <div style={styles.inputGroup}>
-            <label style={styles.label}>จำนวนเด็ก:</label>
-            <input
-              type="number"
-              required
-              min="0"
-              value={formData.childCount}
-              onChange={(e) => setFormData({ ...formData, childCount: e.target.value })}
-              style={styles.input}
-            />
-          </div>
-
-          <button type="submit" disabled={loading} style={styles.primaryButton}>
-            {loading ? 'กำลังตรวจสอบ...' : 'เปิดโต๊ะ'}
-          </button>
-        </form>
+      {/* ข้อความแจ้งเตือนส่งออเดอร์สำเร็จ */}
+      {orderSuccessMsg && (
+        <div style={styles.successNotification}>
+          ✅ ส่งออเดอร์เรียบร้อยแล้ว! สามารถสั่งเพิ่มได้ทันที
+        </div>
       )}
 
-      {/* --- กล่องเตือน เมื่อโต๊ะมี Session เปิดค้างอยู่แล้ว (ข้อ 3) --- */}
-      {activeSession && !createdSessionData && (
-        <div style={styles.warningCard}>
-          <h3 style={styles.warningTitle}>⚠️ แจ้งเตือน: โต๊ะนี้ไม่ว่าง</h3>
-          <p style={styles.warningText}>โต๊ะนี้มีลูกค้าอยู่ระหว่างทานอาหาร กรุณาปิดออเดอร์เดิมก่อน</p>
+      {/* --- แท็บหมวดหมู่เมนู (ข้อ 2) --- */}
+      <div style={styles.categoryScroll}>
+        {categories.map((cat) => (
           <button
-            onClick={() => setShowConfirmModal(true)}
-            style={styles.warningActionButton}
+            key={cat.id}
+            onClick={() => setActiveCategory(cat.id)}
+            style={{
+              ...styles.categoryTab,
+              backgroundColor: activeCategory === cat.id ? '#2563eb' : '#e5e7eb',
+              color: activeCategory === cat.id ? '#fff' : '#374151',
+            }}
           >
-            ปิดออเดอร์เดิม
+            {cat.name}
+          </button>
+        ))}
+      </div>
+
+      {/* --- รายการเมนูอาหารในหมวดหมู่ --- */}
+      <div style={styles.menuListContainer}>
+        {currentCategoryItems.length === 0 ? (
+          <p style={{ textAlign: 'center', color: '#6b7280', padding: '2rem' }}>ไม่มีรายการเมนูในหมวดหมู่นี้</p>
+        ) : (
+          currentCategoryItems.map((item) => {
+            const qty = cart[item.name] || 0
+            return (
+              <div key={item.id} style={styles.menuCard}>
+                <div style={{ flex: 1, paddingRight: '10px' }}>
+                  <h3 style={styles.menuName}>{item.name}</h3>
+                </div>
+                <div style={styles.counterControl}>
+                  {qty > 0 ? (
+                    <>
+                      <button 
+                        onClick={() => handleQuantityChange(item.name, -1)} 
+                        style={styles.qtyBtn}
+                      >
+                        -
+                      </button>
+                      <span style={styles.qtyText}>{qty}</span>
+                      <button 
+                        onClick={() => handleQuantityChange(item.name, 1)} 
+                        style={styles.qtyBtn}
+                      >
+                        +
+                      </button>
+                    </>
+                  ) : (
+                    <button 
+                      onClick={() => handleQuantityChange(item.name, 1)} 
+                      style={styles.addBtn}
+                    >
+                      + เพิ่ม
+                    </button>
+                  )}
+                </div>
+              </div>
+            )
+          })
+        )}
+      </div>
+
+      {/* --- ตะกร้าลอยด้านล่างจอ (Sticky Bottom Cart) --- */}
+      {totalCartCount > 0 && (
+        <div style={styles.stickyCart}>
+          <div style={styles.cartInfo}>
+            <span style={styles.cartCountBadge}>{totalCartCount}</span>
+            <span>รายการในตะกร้า (สูงสุด 10)</span>
+          </div>
+          <button 
+            onClick={handleSubmitOrder} 
+            disabled={submitting}
+            style={styles.submitOrderBtn}
+          >
+            {submitting ? 'กำลังส่ง...' : 'ส่งออเดอร์ 🚀'}
           </button>
         </div>
       )}
 
-      {/* --- Modal ยืนยันปิดโต๊ะเดิม --- */}
-      {showConfirmModal && activeSession && (
+      {/* --- Modal ยืนยันเรียกเก็บเงิน --- */}
+      {showCheckoutModal && (
         <div style={styles.modalOverlay}>
           <div style={styles.modalContent}>
-            <h2 style={{ color: '#dc2626', marginBottom: '15px' }}>ยืนยันปิดโต๊ะเดิม</h2>
-            <div style={styles.modalInfoBox}>
-              <p><strong>โต๊ะเลขที่:</strong> {activeSession.table_number}</p>
-              <p><strong>จำนวนคน:</strong> ผู้ใหญ่ {activeSession.adult_count} / เด็ก {activeSession.child_count}</p>
-              <p><strong>สถานะ:</strong> เปิดมาแล้ว <span style={{ color: '#dc2626', fontSize: '1.2rem' }}>{elapsedMinutes}</span> นาที</p>
+            <h2 style={{ color: '#1f2937', marginBottom: '15px' }}>ยืนยันการเรียกเก็บเงิน</h2>
+            <div style={styles.billBox}>
+              <p>ผู้ใหญ่: {session.adult_count} ท่าน × 289.-</p>
+              <p>เด็ก: {session.child_count} ท่าน × 145.-</p>
+              <hr style={{ margin: '10px 0', border: '0.5px solid #d1d5db' }} />
+              <p style={{ fontSize: '1.4rem', fontWeight: 'bold', color: '#2563eb' }}>
+                ยอดรวมสุทธิ: {totalBill.toLocaleString()} บาท
+              </p>
             </div>
-            <p style={{ margin: '15px 0', fontSize: '1rem' }}>คุณต้องการปิดโต๊ะนี้เพื่อล้างข้อมูลและเปิดใหม่ใช่หรือไม่?</p>
-            
-            <div style={styles.modalButtonRow}>
-              <button
-                onClick={() => setShowConfirmModal(false)}
-                style={styles.cancelButton}
-                disabled={loading}
+            <p style={{ fontSize: '0.95rem', color: '#6b7280', margin: '15px 0' }}>
+              เมื่อยืนยันแล้ว ระบบจะปิดโต๊ะและไม่สามารถสั่งอาหารเพิ่มได้อีก
+            </p>
+            <div style={styles.modalBtnRow}>
+              <button 
+                onClick={() => setShowCheckoutModal(false)} 
+                style={styles.modalCancelBtn}
+                disabled={checkingOut}
               >
                 ยกเลิก
               </button>
-              <button
-                onClick={handleCloseExistingSession}
-                style={styles.confirmButton}
-                disabled={loading}
+              <button 
+                onClick={handleCheckoutConfirm} 
+                style={styles.modalConfirmBtn}
+                disabled={checkingOut}
               >
-                {loading ? 'กำลังดำเนินการ...' : 'ยืนยันปิดโต๊ะเดิม'}
+                {checkingOut ? 'กำลังดำเนินการ...' : 'ยืนยันเรียกเก็บเงิน'}
               </button>
             </div>
           </div>
         </div>
       )}
-
-      {/* --- กรณีที่ 2: สร้าง Session สำเร็จ แสดงรูป QR Code (ข้อ 4) --- */}
-      {createdSessionData && (
-        <div style={styles.successCard}>
-          <h2 style={{ color: '#16a34a', marginBottom: '10px' }}>✅ เปิดโต๊ะสำเร็จ!</h2>
-          
-          <div style={styles.qrContainer}>
-            <img src={qrCodeImageUrl} alt="QR Code สำหรับสั่งอาหาร" style={styles.qrImage} />
-          </div>
-
-          <p style={styles.summaryText}>
-            โต๊ะ {createdSessionData.table_number} · ผู้ใหญ่ {createdSessionData.adult_count} · เด็ก {createdSessionData.child_count}
-          </p>
-
-          <div style={styles.linkBox}>
-            <span style={styles.linkText}>{targetUrl}</span>
-            <button onClick={() => handleCopyLink(targetUrl)} style={styles.copyButton}>
-              คัดลอกลิงก์
-            </button>
-          </div>
-
-          <button onClick={handleReset} style={styles.resetButton}>
-            + เปิดโต๊ะใหม่ / โต๊ะอื่น
-          </button>
-        </div>
-      )}
-    </main>
+    </div>
   )
 }
 
-// --- สไตล์ CSS แบบ Inline สำหรับความรวดเร็วและตัวหนังสือใหญ่อ่านง่าย ---
+// --- ดีไซน์สไตล์มือถือ (Mobile-first, กดง่ายด้วยนิ้วโป้ง) ---
 const styles = {
   container: {
-    maxWidth: '600px',
+    maxWidth: '480px',
     margin: '0 auto',
-    padding: '2rem 1rem',
+    minHeight: '100vh',
+    backgroundColor: '#f9fafb',
+    paddingBottom: '100px', // เว้นพื้นที่ให้ตะกร้าลอยด้านล่าง
     fontFamily: 'sans-serif',
-    color: '#1f2937',
+    boxSizing: 'border-box',
+    position: 'relative',
   },
-  headerTitle: {
-    fontSize: '2rem',
-    fontWeight: 'bold',
+  centerScreen: {
+    display: 'flex',
+    justifyContent: 'center',
+    alignItems: 'center',
+    height: '100vh',
     textAlign: 'center',
-    marginBottom: '5px',
+    padding: '20px',
+    backgroundColor: '#f3f4f6',
   },
-  subTitle: {
-    textAlign: 'center',
-    color: '#6b7280',
-    marginBottom: '2rem',
-    fontSize: '1.1rem',
-  },
-  errorBox: {
+  alertBoxRed: {
     backgroundColor: '#fee2e2',
     color: '#b91c1c',
-    padding: '12px',
+    padding: '2rem',
+    borderRadius: '12px',
+    border: '2px solid #ef4444',
+  },
+  alertBoxGreen: {
+    backgroundColor: '#f0fdf4',
+    color: '#166534',
+    padding: '2.5rem',
+    borderRadius: '16px',
+    border: '2px solid #22c55e',
+  },
+  header: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    padding: '16px',
+    backgroundColor: '#ffffff',
+    borderBottom: '1px solid #e5e7eb',
+    position: 'sticky',
+    top: 0,
+    zIndex: 10,
+  },
+  shopTitle: {
+    fontSize: '1.2rem',
+    fontWeight: 'bold',
+    color: '#1f2937',
+    margin: 0,
+  },
+  tableBadge: {
+    fontSize: '0.9rem',
+    color: '#4b5563',
+    margin: '2px 0 0 0',
+    fontWeight: '600',
+  },
+  checkoutButton: {
+    backgroundColor: '#ef4444',
+    color: '#fff',
+    border: 'none',
+    padding: '8px 12px',
     borderRadius: '8px',
-    marginBottom: '1.5rem',
+    fontWeight: 'bold',
+    fontSize: '0.9rem',
+    cursor: 'pointer',
+  },
+  successNotification: {
+    backgroundColor: '#dcfce7',
+    color: '#166534',
+    padding: '12px',
     textAlign: 'center',
     fontWeight: 'bold',
+    fontSize: '0.95rem',
   },
-  formCard: {
-    backgroundColor: '#f9fafb',
-    border: '2px solid #e5e7eb',
-    borderRadius: '12px',
-    padding: '2rem',
-    boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1)',
+  categoryScroll: {
+    display: 'flex',
+    gap: '8px',
+    overflowX: 'auto',
+    padding: '12px 16px',
+    backgroundColor: '#ffffff',
+    borderBottom: '1px solid #e5e7eb',
+    whiteSpace: 'nowrap',
   },
-  inputGroup: {
-    marginBottom: '1.5rem',
-  },
-  label: {
-    display: 'block',
-    fontSize: '1.2rem',
+  categoryTab: {
+    padding: '10px 16px',
+    borderRadius: '20px',
+    border: 'none',
     fontWeight: 'bold',
-    marginBottom: '8px',
+    fontSize: '0.95rem',
+    cursor: 'pointer',
+    flexShrink: 0,
   },
-  input: {
-    width: '100%',
-    padding: '14px',
-    fontSize: '1.2rem',
-    borderRadius: '8px',
-    border: '1px solid #d1d5db',
-    boxSizing: 'border-box',
+  menuListContainer: {
+    padding: '16px',
   },
-  primaryButton: {
-    width: '100%',
+  menuCard: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    backgroundColor: '#ffffff',
+    padding: '16px',
+    borderRadius: '12px',
+    marginBottom: '12px',
+    boxShadow: '0 1px 3px rgba(0,0,0,0.05)',
+  },
+  menuName: {
+    fontSize: '1.1rem',
+    fontWeight: 'bold',
+    color: '#1f2937',
+    margin: 0,
+  },
+  counterControl: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '10px',
+  },
+  addBtn: {
     backgroundColor: '#2563eb',
     color: '#fff',
-    padding: '16px',
-    fontSize: '1.3rem',
-    fontWeight: 'bold',
     border: 'none',
+    padding: '8px 16px',
     borderRadius: '8px',
-    cursor: 'pointer',
-    marginTop: '1rem',
-  },
-  warningCard: {
-    backgroundColor: '#fef2f2',
-    border: '3px solid #ef4444',
-    borderRadius: '12px',
-    padding: '2rem',
-    textAlign: 'center',
-    marginTop: '1.5rem',
-  },
-  warningTitle: {
-    color: '#dc2626',
-    fontSize: '1.5rem',
     fontWeight: 'bold',
-    marginBottom: '10px',
+    fontSize: '1rem',
+    cursor: 'pointer',
   },
-  warningText: {
+  qtyBtn: {
+    backgroundColor: '#e5e7eb',
+    color: '#1f2937',
+    border: 'none',
+    width: '36px',
+    height: '36px',
+    borderRadius: '50%',
+    fontWeight: 'bold',
     fontSize: '1.2rem',
-    color: '#7f1d1d',
-    marginBottom: '1.5rem',
+    cursor: 'pointer',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
   },
-  warningActionButton: {
-    backgroundColor: '#dc2626',
+  qtyText: {
+    fontSize: '1.2rem',
+    fontWeight: 'bold',
+    width: '20px',
+    textAlign: 'center',
+  },
+  stickyCart: {
+    position: 'fixed',
+    bottom: 0,
+    left: 0,
+    right: 0,
+    maxWidth: '480px',
+    margin: '0 auto',
+    backgroundColor: '#1f2937',
+    color: '#fff',
+    padding: '16px 20px',
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    boxShadow: '0 -4px 6px -1px rgba(0,0,0,0.1)',
+    zIndex: 20,
+    borderTopLeftRadius: '16px',
+    borderTopRightRadius: '16px',
+  },
+  cartInfo: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '10px',
+    fontSize: '1rem',
+    fontWeight: 'bold',
+  },
+  cartCountBadge: {
+    backgroundColor: '#2563eb',
+    color: '#fff',
+    width: '28px',
+    height: '28px',
+    borderRadius: '50%',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    fontSize: '0.9rem',
+  },
+  submitOrderBtn: {
+    backgroundColor: '#22c55e',
     color: '#fff',
     border: 'none',
-    padding: '14px 28px',
-    fontSize: '1.2rem',
-    fontWeight: 'bold',
+    padding: '10px 20px',
     borderRadius: '8px',
+    fontWeight: 'bold',
+    fontSize: '1rem',
     cursor: 'pointer',
   },
   modalOverlay: {
     position: 'fixed',
     top: 0,
     left: 0,
-    width: '100vw',
-    height: '100vh',
+    right: 0,
+    bottom: 0,
     backgroundColor: 'rgba(0, 0, 0, 0.6)',
     display: 'flex',
     justifyContent: 'center',
     alignItems: 'center',
     zIndex: 1000,
-    padding: '1rem',
+    padding: '16px',
   },
   modalContent: {
     backgroundColor: '#fff',
-    padding: '2rem',
-    borderRadius: '12px',
-    maxWidth: '450px',
+    padding: '24px',
+    borderRadius: '16px',
     width: '100%',
+    maxWidth: '400px',
     textAlign: 'center',
-    boxShadow: '0 20px 25px -5px rgba(0, 0, 0, 0.3)',
+    boxShadow: '0 20px 25px -5px rgba(0,0,0,0.3)',
   },
-  modalInfoBox: {
+  billBox: {
     backgroundColor: '#f3f4f6',
-    padding: '12px',
-    borderRadius: '8px',
+    padding: '16px',
+    borderRadius: '12px',
     textAlign: 'left',
     fontSize: '1.1rem',
     lineHeight: '1.6',
   },
-  modalButtonRow: {
+  modalBtnRow: {
     display: 'flex',
     gap: '10px',
     marginTop: '20px',
   },
-  cancelButton: {
+  modalCancelBtn: {
     flex: 1,
     backgroundColor: '#9ca3af',
     color: '#fff',
-    padding: '12px',
-    fontSize: '1.1rem',
-    fontWeight: 'bold',
     border: 'none',
-    borderRadius: '8px',
-    cursor: 'pointer',
-  },
-  confirmButton: {
-    flex: 1,
-    backgroundColor: '#dc2626',
-    color: '#fff',
     padding: '12px',
-    fontSize: '1.1rem',
+    borderRadius: '8px',
     fontWeight: 'bold',
-    border: 'none',
-    borderRadius: '8px',
-    cursor: 'pointer',
-  },
-  successCard: {
-    backgroundColor: '#f0fdf4',
-    border: '3px solid #22c55e',
-    borderRadius: '12px',
-    padding: '2rem',
-    textAlign: 'center',
-  },
-  qrContainer: {
-    margin: '1.5rem 0',
-    display: 'inline-block',
-    padding: '10px',
-    backgroundColor: '#fff',
-    borderRadius: '8px',
-    boxShadow: '0 2px 4px rgba(0,0,0,0.1)',
-  },
-  qrImage: {
-    width: '260px',
-    height: '260px',
-    display: 'block',
-  },
-  summaryText: {
-    fontSize: '1.4rem',
-    fontWeight: 'bold',
-    color: '#166534',
-    marginBottom: '1rem',
-  },
-  linkBox: {
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    backgroundColor: '#fff',
-    border: '1px solid #d1d5db',
-    padding: '10px 15px',
-    borderRadius: '8px',
-    marginBottom: '1.5rem',
-    wordBreak: 'break-all',
-  },
-  linkText: {
     fontSize: '1rem',
-    color: '#4b5563',
-    textAlign: 'left',
-    marginRight: '10px',
-  },
-  copyButton: {
-    backgroundColor: '#4b5563',
-    color: '#fff',
-    border: 'none',
-    padding: '8px 12px',
-    fontSize: '0.9rem',
-    borderRadius: '6px',
     cursor: 'pointer',
-    whiteSpace: 'nowrap',
   },
-  resetButton: {
-    width: '100%',
-    backgroundColor: '#16a34a',
+  modalConfirmBtn: {
+    flex: 1,
+    backgroundColor: '#2563eb',
     color: '#fff',
-    padding: '14px',
-    fontSize: '1.2rem',
-    fontWeight: 'bold',
     border: 'none',
+    padding: '12px',
     borderRadius: '8px',
+    fontWeight: 'bold',
+    fontSize: '1rem',
     cursor: 'pointer',
   },
 }
